@@ -1,0 +1,174 @@
+<!doctype html>
+<!-- Source: https://github.com/franciscocarloserra/p2p-board -->
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>p2p board</title>
+<link rel="icon" href="data:,">
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;background:#111;color:#ddd;font:clamp(15px,4vw,17px)/1.4 ui-monospace,Menlo,Consolas,monospace;display:flex;flex-direction:column;height:100dvh}
+  #bar{display:flex;justify-content:space-between;padding:10px 12px;font-size:.85em;color:#888;border-bottom:1px solid #222}
+  #copy{all:unset;cursor:pointer;text-decoration:underline}
+  #list{flex:1;overflow-y:auto;margin:0;padding:0;list-style:none}
+  #list li{display:flex;gap:12px;justify-content:space-between;word-break:break-word;padding:8px 12px}
+  #list .ts{flex-shrink:0;color:#444;font-size:.8em;align-self:center}
+  #list li:nth-child(even){background:#1a1a1a}
+  form{display:flex;margin:0;border-top:1px solid #333;background:#000;padding-bottom:env(safe-area-inset-bottom)}
+  input{flex:1;min-width:0;padding:14px 12px;font:inherit;font-size:16px;background:#000;color:#eee;caret-color:#eee;border:0;outline:0}
+  button{width:56px;font:inherit;font-size:20px;background:#111;color:#ddd;border:0}
+</style></head><body>
+<div id="bar"><span id="status">connecting...</span><button id="copy">copy link</button></div>
+<ul id="list"></ul>
+<form id="f"><input id="t" autocomplete="off" autocapitalize="none" enterkeyhint="send"></form>
+<script type="module">
+window.onerror = window.onunhandledrejection = e => { document.getElementById('status').textContent = 'error: ' + (e.reason || e.message || e); };
+import {joinRoom} from './trystero-nostr.mjs';
+
+const VERSION = '2026-09-30.24';
+console.log('p2p-board', VERSION, 'source: https://github.com/franciscocarloserra/p2p-board');
+
+// Tunable parameters
+const P = {
+  "appId": "p2p-board-poc-7f3a9c",
+  "maxTextLength": 140,
+  "maxMsgsPerSecPerPeer": 3,
+  "strikesBeforeIgnore": 5,
+  "maxPayloadBytes": 16384,
+  "maxStoredMessages": 50,
+  "randomBytes": 16,
+  "copiedFeedbackMs": 1500,
+  "blipGain": 0.03,
+  "blipFreqHz": 880,
+  "blipMs": 90,
+  "relayUrls": ["wss://nos.lol", "wss://relay.primal.net", "wss://nostr.mom"]
+};
+const TEXT_RE = /^[a-z0-9 ?]+$/;
+const TS_RE = /^(.*) ([01]\d|2[0-3])([0-5]\d)$/; // optional trailing " HHMM" appended by the sender's client
+const $ = id => document.getElementById(id);
+
+// Room and password live in the URL hash: #room:password
+const rand = () => [...crypto.getRandomValues(new Uint8Array(P.randomBytes))]
+  .map(b => b.toString(16).padStart(2, '0')).join('');
+if (!/^#[^:]+:.+/.test(location.hash)) location.hash = rand() + ':' + rand();
+const [room, ...pw] = decodeURIComponent(location.hash.slice(1)).split(':');
+const password = pw.join(':');
+
+const cfg = {appId: P.appId, password};
+if (P.relayUrls.length) cfg.relayConfig = {urls: P.relayUrls};
+const r = joinRoom(cfg, room);
+const msgAct = r.makeAction('msg');
+const snapAct = r.makeAction('snap');
+
+const messages = []; // in-memory only
+const validText = s => typeof s === 'string' && s.length > 0 && s.length <= P.maxTextLength && TEXT_RE.test(s);
+
+function render() {
+  const ul = $('list');
+  ul.replaceChildren(...messages.map(m => {
+    const li = document.createElement('li'), body = document.createElement('span');
+    const t = m.match(TS_RE);
+    body.textContent = t ? t[1] : m;
+    li.append(body);
+    if (t) { const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = t[2] + ':' + t[3]; li.append(ts); }
+    return li;
+  }));
+  ul.scrollTop = ul.scrollHeight;
+}
+function store(text) {
+  messages.push(text);
+  while (messages.length > P.maxStoredMessages) messages.shift();
+}
+function status() { $('status').textContent = `peers ${Object.keys(r.getPeers()).length}`; }
+
+// Strict envelope check: exact own keys, exact types. Returns value or null.
+function parse(raw, keys) {
+  if (typeof raw !== 'string' || new TextEncoder().encode(raw).length > P.maxPayloadBytes) return null; // size check BEFORE parsing
+  let o;
+  try { o = JSON.parse(raw); } catch { return null; }
+  if (o === null || typeof o !== 'object' || Array.isArray(o)) return null;
+  const k = Object.keys(o);
+  if (k.length !== keys.length || !keys.every(x => Object.hasOwn(o, x))) return null; // also rejects __proto__/constructor extras
+  return o;
+}
+
+// Per-peer rate limit; flooders get ignored.
+const peerState = new Map();
+function allowed(peer) {
+  const s = peerState.get(peer) ?? {start: 0, n: 0, strikes: 0};
+  peerState.set(peer, s);
+  if (s.strikes >= P.strikesBeforeIgnore) return false;
+  const now = Date.now();
+  if (now - s.start >= 1000) { s.start = now; s.n = 0; }
+  if (++s.n > P.maxMsgsPerSecPerPeer) { s.strikes++; return false; }
+  return true;
+}
+
+msgAct.onMessage = (raw, {peerId: peer}) => {
+  if (!allowed(peer)) return;
+  const o = parse(raw, ['text']);
+  if (!o || !validText(o.text)) return;
+  store(o.text); render(); blip();
+};
+
+let gotSnap = false; // accept only one snapshot (from the first peer that answers)
+snapAct.onMessage = (raw, {peerId: peer}) => {
+  if (gotSnap || !allowed(peer)) return;
+  const o = parse(raw, ['msgs']);
+  if (!o || !Array.isArray(o.msgs) || o.msgs.length > P.maxStoredMessages || !o.msgs.every(validText)) return;
+  gotSnap = true;
+  messages.splice(0, 0, ...o.msgs);
+  while (messages.length > P.maxStoredMessages) messages.shift();
+  render();
+};
+
+r.onPeerJoin = peer => {
+  status();
+  if (messages.length) snapAct.send(JSON.stringify({msgs: messages}), {target: peer});
+};
+r.onPeerLeave = peer => { peerState.delete(peer); status(); };
+
+// Very soft blip on incoming messages
+let ac;
+function blip() {
+  if (!ac || ac.state !== 'running') return; // audio unlocks after the first user gesture
+  const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime, d = P.blipMs / 1000;
+  o.frequency.value = P.blipFreqHz;
+  g.gain.setValueAtTime(P.blipGain, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(g).connect(ac.destination);
+  o.start(t); o.stop(t + d);
+}
+addEventListener('pointerdown', () => { ac ??= new AudioContext(); ac.resume(); });
+
+// Filter as you type: lowercase, drop anything outside a-z, 0-9, space and ?; leave room for the " HHMM" suffix
+const maxBody = P.maxTextLength - 5;
+$('t').maxLength = maxBody;
+// Only rewrite when something actually changes and never mid-composition (mobile keyboards), keeping the caret in place
+function clean() {
+  const el = $('t'), v = el.value.toLowerCase().replace(/[^a-z0-9 ?]/g, '').slice(0, maxBody);
+  if (v === el.value) return;
+  const pos = Math.max(0, el.selectionStart - (el.value.length - v.length));
+  el.value = v;
+  el.setSelectionRange(pos, pos);
+}
+$('t').addEventListener('input', e => { if (!e.isComposing) clean(); });
+$('t').addEventListener('compositionend', clean);
+
+$('copy').onclick = async () => {
+  await navigator.clipboard.writeText(location.href);
+  $('copy').textContent = 'copied';
+  setTimeout(() => $('copy').textContent = 'copy link', P.copiedFeedbackMs);
+};
+
+$('f').addEventListener('submit', e => {
+  e.preventDefault();
+  const body = $('t').value.trim();
+  if (!body) return;
+  const d = new Date(), text = body + ' ' + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0');
+  if (!validText(text)) return;
+  store(text); render();
+  msgAct.send(JSON.stringify({text}));
+  $('t').value = '';
+});
+status();
+</script></body></html>
